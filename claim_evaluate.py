@@ -1,361 +1,198 @@
+#Claim Processor & Langgraph
 
-# CLAIM PROCESSOR - LANGGRAPH + LOCAL OLLAMA LLM
-
-
+import streamlit as st
 import os
 import pickle
-from typing import TypedDict, Optional, Dict, Any, List
-
-import faiss
+import json
+import re
+from typing import TypedDict, Optional, Any
 import numpy as np
+import faiss
 
-from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
-"""
-from langgraph.graph import (
-    StateGraph,
-    START,
-    END
-)
+from langchain_ollama import ChatOllama
 
-from langgraph.types import Send
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
 
-
-
-# FILE LOCATIONS
-
+#Referencing the Policy files
+POLICY_FAISS_FILE = "insurance_policy.faiss"
+POLICY_METADATA_FILE = "insurance_policy.pkl"
 
 CLAIMS_FAISS_FILE = "claims.faiss"
-
 CLAIMS_METADATA_FILE = "claim_metadata.pkl"
 
 CLAIM_STATUS_FILE = "claim_status.pkl"
 
-POLICY_FAISS_FILE = "insurance_policy.faiss"
-
-POLICY_METADATA_FILE = "insurance_policy.pkl"
-
+# New file created by the processing workflow
 CLAIM_RESULTS_FILE = "claim_results.pkl"
 
+#verifying the files
+required_files = [
+    POLICY_FAISS_FILE,
+    POLICY_METADATA_FILE,
+    CLAIMS_FAISS_FILE,
+    CLAIMS_METADATA_FILE,
+    CLAIM_STATUS_FILE
+]
+
+for file in required_files:
+    print(
+        f"{file}:",
+        "FOUND" if os.path.exists(file) else "MISSING"
+    )
 
 
-# LLM
-
-
+#initialize LLM
 llm = ChatOllama(
-    model="gemma4:e2b",
+    model="llama3.1",
     temperature=0
 )
 
-
-
-# EMBEDDING MODEL
-
-
+# intialize embedding model
 embedding_model = HuggingFaceEmbeddings(
     model_name="BAAI/bge-small-en-v1.5"
 )
 
 
+#creating generic Generic pickle helper functions - load pickle
+def load_pickle(filename, default=None):
 
-# GRAPH STATE
-
-
-class ClaimState(TypedDict, total=False):
-
-    claim_number: int
-
-    claimant_name: str
-
-    claim_amount: float
-
-    claim_documents: List[Dict[str, Any]]
-
-    policy_context: str
-
-    document_result: Dict[str, Any]
-
-    eligibility_result: Dict[str, Any]
-
-    fraud_result: Dict[str, Any]
-
-    summary_result: Dict[str, Any]
-
-    human_result: Dict[str, Any]
-
-    final_decision: str
-
-    final_reason: str
-
-    processing_status: str
-
-
-
-# CLAIM STATUS FUNCTIONS
-
-
-def load_claim_status():
-
-    if not os.path.exists(CLAIM_STATUS_FILE):
-        return []
+    if not os.path.exists(filename):
+        return default
 
     try:
+        with open(filename, "rb") as f:
+            return pickle.load(f)
 
-        with open(
-            CLAIM_STATUS_FILE,
-            "rb"
-        ) as f:
+    except Exception as e:
+        print(f"Error loading {filename}: {e}")
+        return default
 
-            data = pickle.load(f)
+#creating generic Generic pickle helper functions - save pickle
+def save_pickle(filename, data):
 
-            if isinstance(data, list):
-                return data
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
 
-            return []
-
-    except Exception:
-
-        return []
+    print(f"Saved: {filename}")
 
 
-def save_claim_status_data(data):
-
-    with open(
-        CLAIM_STATUS_FILE,
-        "wb"
-    ) as f:
-
-        pickle.dump(
-            data,
-            f
-        )
-
-
+#Function to update claim status
 def update_claim_status(
-    claim_number: int,
-    new_status: str,
-    reason: Optional[str] = None
+    claim_number,
+    status
 ):
 
-    data = load_claim_status()
+    data = load_pickle(
+        CLAIM_STATUS_FILE,
+        []
+    )
 
-    claim_found = False
+    claim_number = int(claim_number)
+
+    found = False
 
     for item in data:
 
         if int(
-            item.get(
-                "claim_number",
-                -1
-            )
-        ) == int(claim_number):
+            item.get("claim_number", -1)
+        ) == claim_number:
 
-            item["claim_status"] = new_status
-
-            if reason is not None:
-                item["reason"] = reason
-
-            claim_found = True
-
+            item["claim_status"] = status
+            found = True
             break
 
-    if not claim_found:
+    if not found:
 
-        new_record = {
-            "claim_number": int(claim_number),
-            "claim_status": new_status
-        }
+        data.append(
+            {
+                "claim_number": claim_number,
+                "claim_status": status
+            }
+        )
 
-        if reason is not None:
-            new_record["reason"] = reason
+    save_pickle(
+        CLAIM_STATUS_FILE,
+        data
+    )
 
-        data.append(new_record)
+    return data
 
-    save_claim_status_data(data)
+#load claim status
+claim_status_data = load_pickle(
+    CLAIM_STATUS_FILE,
+    []
+)
 
+#Load the claims metadata
+claim_metadata = load_pickle(
+    CLAIMS_METADATA_FILE,
+    []
+)
 
+#Function to load a specific claim
 
-# CLAIM METADATA
-
-
-def load_claim_metadata():
-
-    if not os.path.exists(
-        CLAIMS_METADATA_FILE
-    ):
-        return []
-
-    try:
-
-        with open(
-            CLAIMS_METADATA_FILE,
-            "rb"
-        ) as f:
-
-            metadata = pickle.load(f)
-
-            if isinstance(metadata, list):
-                return metadata
-
-            return []
-
-    except Exception:
-
-        return []
-
-
-def get_claim_documents(
-    claim_number: int
+def load_claim(
+    claim_number
 ):
 
-    metadata = load_claim_metadata()
+    claim_number = int(
+        claim_number
+    )
 
-    claim_documents = []
+    metadata = load_pickle(
+        CLAIMS_METADATA_FILE,
+        []
+    )
 
-    claimant_name = ""
-
-    claim_amount = 0.0
-
-    for item in metadata:
-
+    records = [
+        item
+        for item in metadata
         if int(
             item.get(
                 "claim_number",
                 -1
             )
-        ) == int(claim_number):
+        ) == claim_number
+    ]
 
-            claim_documents.append(item)
+    if not records:
 
-            claimant_name = item.get(
-                "claimant_name",
-                claimant_name
-            )
+        raise ValueError(
+            f"Claim {claim_number} "
+            f"was not found in "
+            f"{CLAIMS_METADATA_FILE}"
+        )
 
-            claim_amount = float(
-                item.get(
-                    "claim_amount",
-                    claim_amount
-                )
-            )
-
-    return (
-        claimant_name,
-        claim_amount,
-        claim_documents
+    claimant_name = records[0].get(
+        "claimant_name",
+        ""
     )
 
-
-
-# POLICY RAG
-
-
-def load_policy_context(
-    query: str,
-    top_k: int = 6
-):
-
-    if not os.path.exists(
-        POLICY_FAISS_FILE
-    ):
-
-        return "Policy knowledge base is unavailable."
-
-    if not os.path.exists(
-        POLICY_METADATA_FILE
-    ):
-
-        return "Policy metadata is unavailable."
-
-    try:
-
-        policy_index = faiss.read_index(
-            POLICY_FAISS_FILE
+    claim_amount = float(
+        records[0].get(
+            "claim_amount",
+            0
         )
+    )
 
-        with open(
-            POLICY_METADATA_FILE,
-            "rb"
-        ) as f:
+    return {
+        "claim_number": claim_number,
+        "claimant_name": claimant_name,
+        "claim_amount": claim_amount,
+        "documents": records
+    }
 
-            policy_metadata = pickle.load(f)
-
-        query_embedding = embedding_model.embed_query(
-            query
-        )
-
-        query_embedding = np.asarray(
-            [query_embedding],
-            dtype="float32"
-        )
-
-        faiss.normalize_L2(
-            query_embedding
-        )
-
-        scores, indices = policy_index.search(
-            query_embedding,
-            min(
-                top_k,
-                policy_index.ntotal
-            )
-        )
-
-        policy_chunks = []
-
-        for score, index_position in zip(
-            scores[0],
-            indices[0]
-        ):
-
-            if index_position < 0:
-                continue
-
-            if index_position >= len(
-                policy_metadata
-            ):
-                continue
-
-            item = policy_metadata[
-                index_position
-            ]
-
-            text = item.get(
-                "text",
-                ""
-            )
-
-            if text:
-
-                policy_chunks.append(
-                    f"[Policy similarity: {score:.4f}]\n{text}"
-                )
-
-        if not policy_chunks:
-
-            return "No relevant policy information was retrieved."
-
-        return "\n\n".join(
-            policy_chunks
-        )
-
-    except Exception as e:
-
-        return (
-            "Policy retrieval failed. "
-            f"Error: {str(e)}"
-        )
-
-
-
-# DOCUMENT TEXT
-
-
-def build_claim_document_text(
+#Group identification and bill documents
+def group_documents(
     documents
 ):
 
-    sections = []
+    grouped = {}
 
     for document in documents:
 
@@ -364,302 +201,166 @@ def build_claim_document_text(
             "unknown"
         )
 
-        document_file = document.get(
-            "document_file",
-            "unknown"
+        if document_type not in grouped:
+
+            grouped[
+                document_type
+            ] = []
+
+        grouped[
+            document_type
+        ].append(document)
+
+    return grouped
+
+
+#Retrieve policy from FAISS
+def retrieve_policy_context(
+    claim_documents,
+    top_k=8
+):
+
+    if not os.path.exists(
+        POLICY_FAISS_FILE
+    ):
+
+        raise FileNotFoundError(
+            POLICY_FAISS_FILE
         )
 
-        text = document.get(
+    if not os.path.exists(
+        POLICY_METADATA_FILE
+    ):
+
+        raise FileNotFoundError(
+            POLICY_METADATA_FILE
+        )
+
+    policy_index = faiss.read_index(
+        POLICY_FAISS_FILE
+    )
+
+    policy_metadata = load_pickle(
+        POLICY_METADATA_FILE,
+        []
+    )
+
+    if not policy_metadata:
+
+        return ""
+
+    # Combine all claim document text.
+    query_text = "\n".join(
+        document.get(
+            "text",
+            ""
+        )
+        for document in claim_documents
+    )
+
+    if not query_text.strip():
+
+        return ""
+
+    # Generate query embedding.
+    query_embedding = (
+        embedding_model.embed_query(
+            query_text
+        )
+    )
+
+    query_embedding = np.asarray(
+        [query_embedding],
+        dtype="float32"
+    )
+
+    # Same normalization used when
+    # the FAISS index was created.
+    faiss.normalize_L2(
+        query_embedding
+    )
+
+    k = min(
+        top_k,
+        policy_index.ntotal
+    )
+
+    if k == 0:
+
+        return ""
+
+    distances, indices = (
+        policy_index.search(
+            query_embedding,
+            k
+        )
+    )
+
+    context = []
+
+    for index in indices[0]:
+
+        if index < 0:
+            continue
+
+        if index >= len(policy_metadata):
+            continue
+
+        metadata = policy_metadata[index]
+
+        text = metadata.get(
             "text",
             ""
         )
 
-        sections.append(
-            f"""
-DOCUMENT TYPE: {document_type}
-DOCUMENT FILE: {document_file}
+        if text.strip():
 
-{text}
-"""
-        )
+            context.append(
+                text
+            )
 
-    return "\n".join(
-        sections
+    return "\n\n".join(
+        context
     )
 
-
-
-# DOCUMENT VERIFICATION AGENT
-
-
-def document_verification_agent(
-    state: ClaimState
+#Return structured JSON from LLM
+def invoke_json(
+    prompt
 ):
 
-    claim_number = state[
-        "claim_number"
-    ]
-
-    documents = state[
-        "claim_documents"
-    ]
-
-    document_text = build_claim_document_text(
-        documents
+    response = llm.invoke(
+        prompt
     )
 
-    prompt = f"""
-You are the Document Verification Agent for an insurance company.
+    content = response.content
 
-Claim Number:
-{claim_number}
+    if not isinstance(
+        content,
+        str
+    ):
 
-Claimant Name:
-{state["claimant_name"]}
+        content = str(content)
 
-Claim Amount:
-Rs. {state["claim_amount"]:,.2f}
+    content = content.strip()
 
-Claim documents:
-
-{document_text}
-
-Insurance policy rules:
-
-- Government-issued identification is required.
-- Policy number/certificate and completed claim form
-  are required where applicable.
-- Bills must show service provider, date,
-  description, amount and invoice/bill number.
-- Supporting documents depend on the claim type.
-- Missing, unclear or inconsistent documents require
-  human review.
-- Do not assume that a document exists if it is not present.
-- Do not hallicunate
-
-Determine:
-
-1. Whether identification is present.
-2. Whether the identification appears valid.
-3. Whether the claimant name reasonably matches
-   the available identity information.
-4. Whether a bill is present.
-5. Whether the bill contains useful information.
-6. Whether important claim information is missing.
-7. Whether there are document inconsistencies.
-
-Return ONLY valid JSON in this format:
-
-{{
-    "documents_complete": true,
-    "identification_valid": true,
-    "claimant_match": true,
-    "bill_valid": true,
-    "missing_documents": [],
-    "document_issues": [],
-    "reason": "short explanation"
-}}
-"""
-
-    response = llm.invoke(prompt)
-
-    result = parse_json_response(
-        response.content
+    # Remove ```json
+    content = re.sub(
+        r"```json\s*",
+        "",
+        content,
+        flags=re.IGNORECASE
     )
 
-    return {
-        "document_result": result
-    }
-
-
-
-# ELIGIBILITY CHECK AGENT
-
-
-def eligibility_check_agent(
-    state: ClaimState
-):
-
-    claim_documents = state[
-        "claim_documents"
-    ]
-
-    document_text = build_claim_document_text(
-        claim_documents
+    # Remove ```
+    content = re.sub(
+        r"```\s*$",
+        "",
+        content
     )
 
-    policy_context = load_policy_context(
-        document_text
-    )
+    content = content.strip()
 
-    prompt = f"""
-You are the Eligibility Check Agent for an insurance company.
-
-Claim Number:
-{state["claim_number"]}
-
-Claimant:
-{state["claimant_name"]}
-
-Claim Amount:
-Rs. {state["claim_amount"]:,.2f}
-
-Claim documents:
-
-{document_text}
-
-Relevant retrieved insurance policy:
-
-{policy_context}
-
-Eligibility rules:
-
-1. Policy must be active on the incident date.
-2. Claimant must be policyholder, insured person,
-   nominee or authorized claimant.
-3. Incident must be covered.
-4. Claim must be reported within the applicable
-   notification period unless valid delay is accepted.
-5. Loss must have sufficient supporting evidence.
-6. Loss must not be excluded.
-7. Claim must be within applicable coverage limits.
-
-Important:
-
-Do not invent a policy number, policy date,
-incident date or coverage information.
-
-If required information cannot be established,
-mark eligibility as "uncertain".
-
-Return ONLY valid JSON:
-
-{{
-    "eligibility": "eligible",
-    "policy_active": true,
-    "claimant_covered": true,
-    "incident_covered": true,
-    "reported_on_time": true,
-    "within_policy_limit": true,
-    "excluded": false,
-    "eligibility_issues": [],
-    "reason": "short explanation"
-}}
-
-The eligibility field must be exactly one of:
-
-"eligible"
-"ineligible"
-"uncertain"
-"""
-
-    response = llm.invoke(prompt)
-
-    result = parse_json_response(
-        response.content
-    )
-
-    return {
-        "eligibility_result": result,
-        "policy_context": policy_context
-    }
-
-
-
-# FRAUD DETECTION AGENT
-
-
-def fraud_detection_agent(
-    state: ClaimState
-):
-
-    documents = state[
-        "claim_documents"
-    ]
-
-    document_text = build_claim_document_text(
-        documents
-    )
-
-    prompt = f"""
-You are the Fraud Detection Agent for an insurance company.
-
-Claim Number:
-{state["claim_number"]}
-
-Claimant:
-{state["claimant_name"]}
-
-Claim Amount:
-Rs. {state["claim_amount"]:,.2f}
-
-Documents:
-
-{document_text}
-
-Look for potential fraud or irregularity indicators:
-
-- Altered or forged documents
-- Duplicate bills or claims
-- Inconsistent dates
-- Inconsistent names
-- Inconsistent amounts
-- Inconsistent incident details
-- Unverifiable service providers
-- Inflated or unreasonable claim amounts
-- Loss before policy activation
-- Repeated claim for the same loss
-- False or misleading information
-- Evidence that the loss may not have occurred
-- Major discrepancies between documents
-
-IMPORTANT:
-
-A fraud indicator does NOT establish fraud.
-
-Do not conclude that the claimant committed fraud.
-
-If suspicious indicators exist, recommend human investigation.
-
-Return ONLY valid JSON:
-
-{{
-    "fraud_risk": "low",
-    "fraud_indicators": [],
-    "document_manipulation_suspected": false,
-    "duplicate_claim_suspected": false,
-    "amount_concern": false,
-    "reason": "short explanation"
-}}
-
-fraud_risk must be exactly:
-
-"low"
-"medium"
-"high"
-"""
-
-    response = llm.invoke(prompt)
-
-    result = parse_json_response(
-        response.content
-    )
-
-    return {
-        "fraud_result": result
-    }
-
-
-
-# JSON PARSER
-
-
-def parse_json_response(
-    content: str
-):
-
-    import json
-
+    # First try direct JSON.
     try:
 
         return json.loads(
@@ -667,37 +368,440 @@ def parse_json_response(
         )
 
     except Exception:
+        pass
 
-        # Try extracting JSON from markdown
+    # If the model included additional text,
+    # extract the JSON object.
+    match = re.search(
+        r"\{.*\}",
+        content,
+        re.DOTALL
+    )
 
-        start = content.find("{")
+    if match:
 
-        end = content.rfind("}")
+        try:
 
-        if start != -1 and end != -1:
+            return json.loads(
+                match.group(0)
+            )
 
-            try:
+        except Exception:
+            pass
 
-                return json.loads(
-                    content[start:end + 1]
-                )
-
-            except Exception:
-                pass
-
-        return {
-            "error": "LLM did not return valid JSON",
-            "raw_response": content
-        }
-
-
-
-# CLAIM SUMMARY AGENT
+    raise ValueError(
+        "LLM did not return valid JSON:\n"
+        + content
+    )
 
 
+#Defining LangGraph state
+class ClaimState(TypedDict, total=False):
+    claim_number: int
+    claimant_name: str
+    claim_amount: float
+    claim_documents: list
+    policy_context: str
+    document_result: dict
+    eligibility_result: dict
+    fraud_result: dict
+    claim_summary: dict
+    final_decision: str
+    final_reason: str
+    human_required: bool
+    human_decision: Optional[str]
+    human_decision_reason: Optional[str]
+
+#Agent to verify document: Node 1
+def document_verification_agent(
+    state: ClaimState
+):
+    documents = state.get(
+        "claim_documents",
+        []
+    )
+
+    grouped = group_documents(
+        documents
+    )
+
+    identification_documents = (
+        grouped.get(
+            "identification",
+            []
+        )
+    )
+
+    bill_documents = (
+        grouped.get(
+            "bill",
+            []
+        )
+    )
+
+    all_text = "\n".join(
+        document.get(
+            "text",
+            ""
+        )
+        for document in documents
+    )
+
+    prompt = f"""
+You are the Document Verification Agent
+for an insurance claim system.
+
+Insurance document requirements:
+
+1. At least one valid government-issued ID.
+2. Policy number/certificate.
+3. Completed claim form.
+4. Depending on claim type, supporting bills/evidence.
+5. Bills should contain:
+   - service provider
+   - date
+   - description
+   - amount
+   - invoice/bill number
+
+CLAIM DOCUMENTS:
+
+{all_text}
+
+Determine whether the supplied documents appear
+complete and internally consistent.
+
+Do not invent information.
+
+Missing or unclear information is a document issue,
+not proof of fraud.
+
+If the bill has claim expiry date before current date then reject the bill.
+If the bill has breakup and amount is less than Rs 10000 and indentification proof is present the approve the claim.
+If not bill breakup is present then reject the claim.
+Since this is testing, so If the ID has an identification number then consider to approve the claim.
+
+Any claim having bill which is below Rs10000 and has invoice number, invoice date, claim name same as ID name, service, description, and service provider specified has to be auto approved.
+Refer only the text content in the document.
+Return ONLY JSON:
+
+{{
+    "documents_complete": true,
+    "identification_present": true,
+    "bill_present": true,
+    "policy_document_present": true,
+    "claim_form_present": true,
+    "bill_details_complete": true,
+    "consistent": true,
+    "document_fraud_indicator": false,
+    "missing_documents": [],
+    "discrepancies": [],
+    "reason": ""
+}}
+
+Use false where the information is clearly missing.
+"""
+
+    result = invoke_json(
+        prompt
+    )
+
+    # Deterministic checks based on actual metadata.
+    result[
+        "identification_present"
+    ] = bool(
+        identification_documents
+    )
+
+    result[
+        "bill_present"
+    ] = bool(
+        bill_documents
+    )
+
+    if "missing_documents" not in result:
+
+        result[
+            "missing_documents"
+        ] = []
+
+    if "discrepancies" not in result:
+
+        result[
+            "discrepancies"
+        ] = []
+
+    if not identification_documents:
+
+        result[
+            "missing_documents"
+        ].append(
+            "Government-issued identification"
+        )
+
+    if not bill_documents:
+
+        result[
+            "missing_documents"
+        ].append(
+            "Bill / supporting document"
+        )
+
+    result[
+        "documents_complete"
+    ] = (
+        len(
+            result["missing_documents"]
+        ) == 0
+        and result.get(
+            "consistent",
+            False
+        )
+        and result.get(
+            "bill_details_complete",
+            False
+        )
+    )
+
+    return {
+        "document_result": result
+    }
+
+#Agent to check Policy Eligibility: Node 2 
+def eligibility_check_agent(
+    state: ClaimState
+):
+
+    policy_context = state.get(
+        "policy_context",
+        ""
+    )
+
+    documents = state.get(
+        "claim_documents",
+        []
+    )
+
+    claim_amount = state.get(
+        "claim_amount",
+        0
+    )
+
+    claim_text = "\n".join(
+        document.get(
+            "text",
+            ""
+        )
+        for document in documents
+    )
+
+    prompt = f"""
+You are the Eligibility Check Agent
+for an insurance claim.
+
+Use the supplied insurance policy and
+claim documents.
+
+INSURANCE POLICY:
+
+{policy_context}
+
+CLAIM AMOUNT:
+
+Rs. {claim_amount:,.2f}
+
+CLAIM DOCUMENTS:
+
+{claim_text}
+
+Eligibility requirements:
+
+1. Policy active on incident date.
+2. Claimant is covered or authorized.
+3. Incident is covered.
+4. Claim reported within applicable period.
+5. Sufficient evidence is supplied.
+6. Loss is not excluded.
+7. Claim is within coverage limits.
+
+Do not assume missing information is true.
+Restrict to policy guideline only.
+If something cannot be established,
+mark it as uncertain. 
+
+If the bill has claim expiry date before current date then reject the bill.
+If the bill has breakup and amount is less than Rs 10000 and indentification proof is present the approve the claim.
+If not bill breakup is present then reject the claim.
+Since this is testing, so If the ID has an identification number then consider to approve the claim.
+Any claim having bill which is below Rs10000 and has invoice number, invoice date, claim name same as ID name, service, description, and service provider specified has to be auto approved.
+Refer only the text content in the document.
+
+Return ONLY JSON:
+
+{{
+    "eligible": true,
+    "policy_active": true,
+    "claimant_covered": true,
+    "incident_covered": true,
+    "reported_in_time": true,
+    "excluded": false,
+    "within_limit": true,
+    "uncertain": false,
+    "reasons": [],
+    "policy_references": []
+}}
+"""
+
+    result = invoke_json(
+        prompt
+    )
+
+    if "reasons" not in result:
+
+        result[
+            "reasons"
+        ] = []
+
+    if "policy_references" not in result:
+
+        result[
+            "policy_references"
+        ] = []
+
+    if not policy_context.strip():
+
+        result[
+            "eligible"
+        ] = False
+
+        result[
+            "uncertain"
+        ] = True
+
+        result[
+            "reasons"
+        ].append(
+            "Policy information could not be retrieved."
+        )
+
+    return {
+        "eligibility_result": result
+    }
+
+
+
+#Agent to Detect Frauds: Node 3
+def fraud_detection_agent(
+    state: ClaimState
+):
+
+    documents = state.get(
+        "claim_documents",
+        []
+    )
+
+    claim_amount = state.get(
+        "claim_amount",
+        0
+    )
+
+    claim_text = "\n".join(
+        document.get(
+            "text",
+            ""
+        )
+        for document in documents
+    )
+
+    prompt = f"""
+You are the Fraud Detection Agent
+for an insurance claim system.
+
+A fraud indicator does NOT establish fraud.
+
+If the bill has claim expiry date before current date then reject the bill.
+If the bill has breakup and amount is less than Rs 10000 and indentification proof is present the approve the claim.
+If not bill breakup is present then reject the claim.
+Since this is testing, so If the ID has an identification number then consider to approve the claim.
+Any claim having bill which is below Rs10000 and has invoice number, invoice date, claim name same as ID name, service, description, and service provider specified has to be auto approved.
+
+Refer only the text content in the document.
+
+Identify potential irregularities requiring
+human investigation.
+
+Claim amount:
+
+Rs. {claim_amount:,.2f}
+
+Claim documents:
+
+{claim_text}
+
+Check for:
+
+- altered documents
+- forged documents
+- duplicate bills
+- inconsistent dates
+- inconsistent names
+- inconsistent amounts
+- inconsistent incident details
+- unverifiable providers
+- inflated amounts
+- loss before policy activation
+- repeated claim
+- misleading information
+- evidence the loss may not have occurred
+- major discrepancies
+
+Return ONLY JSON:
+
+{{
+    "fraud_indicator": false,
+    "risk_level": "LOW",
+    "indicators": [],
+    "inconsistencies": [],
+    "reason": ""
+}}
+"""
+
+    result = invoke_json(
+        prompt
+    )
+
+    if "indicators" not in result:
+
+        result[
+            "indicators"
+        ] = []
+
+    if "inconsistencies" not in result:
+
+        result[
+            "inconsistencies"
+        ] = []
+
+    return {
+        "fraud_result": result
+    }
+
+#Agent to generate claim summary: Node 4
 def claim_summary_agent(
     state: ClaimState
 ):
+
+    claim_number = state[
+        "claim_number"
+    ]
+
+    claimant_name = state[
+        "claimant_name"
+    ]
+
+    claim_amount = state[
+        "claim_amount"
+    ]
 
     document_result = state.get(
         "document_result",
@@ -715,74 +819,66 @@ def claim_summary_agent(
     )
 
     prompt = f"""
-You are the Claim Summary Agent.
-
-Create a concise insurance claim assessment summary.
+Create an insurance claim assessment summary.
 
 Claim Number:
-{state["claim_number"]}
+{claim_number}
 
 Claimant:
-{state["claimant_name"]}
+{claimant_name}
 
 Claim Amount:
-Rs. {state["claim_amount"]:,.2f}
+Rs. {claim_amount:,.2f}
 
 DOCUMENT VERIFICATION:
 
-{document_result}
+{json.dumps(
+    document_result,
+    indent=2
+)}
 
 ELIGIBILITY:
 
-{eligibility_result}
+{json.dumps(
+    eligibility_result,
+    indent=2
+)}
 
 FRAUD ASSESSMENT:
 
-{fraud_result}
+{json.dumps(
+    fraud_result,
+    indent=2
+)}
 
-Generate:
-
-- Claim overview
-- Document verification result
-- Eligibility result
-- Fraud assessment
-- Important issues
-- Recommended routing
-
-Do not invent facts.
-
-Return ONLY valid JSON:
+Return ONLY JSON:
 
 {{
-    "claim_overview": "",
-    "document_assessment": "",
-    "eligibility_assessment": "",
-    "fraud_assessment": "",
-    "important_issues": [],
-    "recommended_routing": ""
+    "summary": "",
+    "key_findings": [],
+    "issues": []
 }}
 """
 
-    response = llm.invoke(
+    summary = invoke_json(
         prompt
     )
 
-    result = parse_json_response(
-        response.content
-    )
-
     return {
-        "summary_result": result
+        "claim_summary": summary
     }
 
-
-
-# HUMAN APPROVAL AGENT
-
-
-def human_approval_agent(
+#Agent to decide whether the claim should be automatically approved, rejected or escalated for human review 
+def automatic_decision_agent(
     state: ClaimState
 ):
+
+    claim_amount = float(
+        state.get(
+            "claim_amount",
+            0
+        )
+    )
 
     document_result = state.get(
         "document_result",
@@ -799,13 +895,144 @@ def human_approval_agent(
         {}
     )
 
-    claim_amount = float(
-        state["claim_amount"]
+    # RULE 1
+    # Rs. 10,000 or more -> human approval
+    if claim_amount >= 10000:
+
+        return {
+            "final_decision":
+                "Human Approval Required",
+
+            "final_reason":
+                "Claim amount is Rs. 10,000 or more.",
+
+            "human_required":
+                True
+        }
+
+    # RULE 2
+    # Missing/invalid documents -> reject
+
+    if not document_result.get(
+        "documents_complete",
+        False
+    ):
+
+        return {
+            "final_decision":
+                "Rejected",
+
+            "final_reason":
+                "Required documents are missing, "
+                "invalid, incomplete or inconsistent.",
+
+            "human_required":
+                False
+        }
+
+    # RULE 3
+    # Eligibility uncertain -> human
+
+    if eligibility_result.get(
+        "uncertain",
+        False
+    ):
+
+        return {
+            "final_decision":
+                "Human Approval Required",
+
+            "final_reason":
+                "Claim eligibility could not be established "
+                "with sufficient certainty.",
+
+            "human_required":
+                True
+        }
+
+    # RULE 4
+    # Definitely ineligible -> reject
+
+    if not eligibility_result.get(
+        "eligible",
+        False
+    ):
+
+        return {
+            "final_decision":
+                "Rejected",
+
+            "final_reason":
+                "Claim does not satisfy policy eligibility "
+                "requirements.",
+
+            "human_required":
+                False
+        }
+    # RULE 5
+    # Fraud indicator -> human investigation
+
+    if fraud_result.get(
+        "fraud_indicator",
+        False
+    ):
+
+        return {
+            "final_decision":
+                "Human Approval Required",
+
+            "final_reason":
+                "Potential fraud or document irregularity "
+                "requires human investigation.",
+
+            "human_required":
+                True
+        }
+
+    # RULE 6
+    # Automatic approval
+
+    return {
+        "final_decision":
+            "Approved",
+
+        "final_reason":
+            "Claim is below Rs. 10,000, eligible, "
+            "documents are complete and consistent, "
+            "and no significant fraud indicators "
+            "were identified.",
+
+        "human_required":
+            False
+    }
+
+#Human agent Node 5
+def human_approval_agent(
+    state: ClaimState
+):
+
+    claim_number = state["claim_number"]
+
+    claim_amount = state["claim_amount"]
+
+    document_result = state.get(
+        "document_result",
+        {}
     )
 
-    reasons = []
+    eligibility_result = state.get(
+        "eligibility_result",
+        {}
+    )
 
-    # High-value claims
+    fraud_result = state.get(
+        "fraud_result",
+        {}
+    )
+
+    # Build reasons for human review
+
+    reasons = []
 
     if claim_amount >= 10000:
 
@@ -813,334 +1040,267 @@ def human_approval_agent(
             "Claim amount is Rs. 10,000 or more."
         )
 
-    # Missing / unclear documents
-
     if not document_result.get(
         "documents_complete",
         False
     ):
 
         reasons.append(
-            "Required documents are missing or incomplete."
-        )
-
-    # Document issues
-
-    if document_result.get(
-        "document_issues"
-    ):
-
-        reasons.append(
-            "Document inconsistencies were identified."
-        )
-
-    # Eligibility uncertainty
-
-    if eligibility_result.get(
-        "eligibility"
-    ) == "uncertain":
-
-        reasons.append(
-            "Claim eligibility could not be established."
-        )
-
-    # Fraud indicators
-
-    fraud_risk = fraud_result.get(
-        "fraud_risk",
-        "low"
-    )
-
-    if fraud_risk in [
-        "medium",
-        "high"
-    ]:
-
-        reasons.append(
-            "Potential fraud or irregularity indicators require investigation."
-        )
-
-    return {
-        "human_result": {
-            "required": True,
-            "reasons": reasons,
-            "message":
-                "Human claims officer approval is required."
-        },
-        "processing_status":
-            "Human Approval Required"
-    }
-
-
-
-# AUTOMATIC ROUTING
-
-
-def route_after_parallel_checks(
-    state: ClaimState
-):
-
-    claim_amount = float(
-        state["claim_amount"]
-    )
-
-    document_result = state.get(
-        "document_result",
-        {}
-    )
-
-    eligibility_result = state.get(
-        "eligibility_result",
-        {}
-    )
-
-    fraud_result = state.get(
-        "fraud_result",
-        {}
-    )
-
-    
-    # Missing / invalid documents
-    
-
-    if not document_result.get(
-        "documents_complete",
-        False
-    ):
-
-        return "reject"
-
-    if not document_result.get(
-        "identification_valid",
-        False
-    ):
-
-        return "reject"
-
-    if not document_result.get(
-        "claimant_match",
-        False
-    ):
-
-        return "human"
-
-    if not document_result.get(
-        "bill_valid",
-        False
-    ):
-
-        return "reject"
-
-    
-    # Eligibility
-    
-
-    eligibility = eligibility_result.get(
-        "eligibility"
-    )
-
-    if eligibility == "ineligible":
-
-        return "reject"
-
-    if eligibility == "uncertain":
-
-        return "human"
-
-    
-    # Fraud
-    
-
-    fraud_risk = fraud_result.get(
-        "fraud_risk",
-        "low"
-    )
-
-    if fraud_risk in [
-        "medium",
-        "high"
-    ]:
-
-        return "human"
-
-    
-    # High value claim
-    
-
-    if claim_amount >= 10000:
-
-        return "human"
-
-    
-    # Automatic approval
-    
-
-    return "approve"
-
-
-
-# AUTO APPROVAL NODE
-
-
-def automatic_approval_node(
-    state: ClaimState
-):
-
-    reason = (
-        "Claim is below Rs. 10,000 and the "
-        "documents, eligibility and fraud checks "
-        "satisfied the automatic approval rules."
-    )
-
-    return {
-        "final_decision": "Approved",
-        "final_reason": reason,
-        "processing_status": "Approved"
-    }
-
-
-
-# REJECTION NODE
-
-
-def rejection_node(
-    state: ClaimState
-):
-
-    document_result = state.get(
-        "document_result",
-        {}
-    )
-
-    eligibility_result = state.get(
-        "eligibility_result",
-        {}
-    )
-
-    reasons = []
-
-    if not document_result.get(
-        "documents_complete",
-        True
-    ):
-
-        missing = document_result.get(
-            "missing_documents",
-            []
-        )
-
-        if missing:
-
-            reasons.append(
-                "Missing documents: "
-                + ", ".join(missing)
-            )
-
-        else:
-
-            reasons.append(
-                "Required documents are incomplete."
-            )
-
-    if not document_result.get(
-        "identification_valid",
-        True
-    ):
-
-        reasons.append(
-            "Identification could not be verified."
-        )
-
-    if not document_result.get(
-        "bill_valid",
-        True
-    ):
-
-        reasons.append(
-            "Bill could not be verified."
+            "Documents require human verification."
         )
 
     if eligibility_result.get(
-        "eligibility"
-    ) == "ineligible":
-
-        eligibility_issues = (
-            eligibility_result.get(
-                "eligibility_issues",
-                []
-            )
-        )
-
-        if eligibility_issues:
-
-            reasons.extend(
-                eligibility_issues
-            )
-
-        else:
-
-            reasons.append(
-                eligibility_result.get(
-                    "reason",
-                    "Claim does not satisfy eligibility requirements."
-                )
-            )
-
-    if not reasons:
-
-        reasons.append(
-            "Claim does not satisfy the automatic processing requirements."
-        )
-
-    return {
-        "final_decision": "Rejected",
-        "final_reason": " ".join(reasons),
-        "processing_status": "Rejected"
-    }
-
-
-
-# SAVE COMPLETE CLAIM RESULT
-
-
-def save_claim_result(
-    state: ClaimState
-):
-
-    if os.path.exists(
-        CLAIM_RESULTS_FILE
+        "uncertain",
+        False
     ):
 
-        try:
+        reasons.append(
+            "Eligibility is uncertain."
+        )
 
-            with open(
-                CLAIM_RESULTS_FILE,
-                "rb"
-            ) as f:
+    if fraud_result.get(
+        "fraud_indicator",
+        False
+    ):
 
-                results = pickle.load(f)
+        reasons.append(
+            "Potential fraud indicators require investigation."
+        )
 
-        except Exception:
+    # Display claim information
 
-            results = []
+    print("\n" + "=" * 60)
+
+    print("HUMAN APPROVAL REQUIRED")
+
+    print("=" * 60)
+
+    print(
+        "Claim Number:",
+        claim_number
+    )
+
+    print(
+        "Claim Amount:",
+        f"Rs. {claim_amount:,.2f}"
+    )
+
+    print("\nReasons for human review:")
+
+    for reason in reasons:
+
+        print(
+            "-",
+            reason
+        )
+
+    print("=" * 60)
+
+    # Ask human for decision
+
+    decision = input(
+        "\nApprove claim? (approve / reject): "
+    )
+
+    decision = decision.strip().lower()
+
+    # Validate input
+
+    while decision not in {
+        "approve",
+        "reject"
+    }:
+
+        print(
+            "\nInvalid input."
+        )
+
+        print(
+            "Please enter: approve or reject"
+        )
+
+        decision = input(
+            "\nApprove claim? (approve / reject): "
+        )
+
+        decision = decision.strip().lower()
+
+    # Ask for reason
+
+    human_reason = input(
+        "\nEnter approval/rejection reason "
+        "(optional): "
+    ).strip()
+
+    # APPROVE
+
+    if decision == "approve":
+
+        final_reason = (
+            human_reason
+            if human_reason
+            else
+            "Claim approved by authorized human reviewer."
+        )
+
+        return {
+
+            "final_decision":
+                "Approved",
+
+            "final_reason":
+                final_reason,
+
+            "human_required":
+                True,
+
+            "human_decision":
+                "approve",
+
+            "human_decision_reason":
+                final_reason
+        }
+
+    # REJECT
 
     else:
 
-        results = []
+        final_reason = (
+            human_reason
+            if human_reason
+            else
+            "Claim rejected by authorized human reviewer."
+        )
 
-    result_record = {
+        return {
+
+            "final_decision":
+                "Rejected",
+
+            "final_reason":
+                final_reason,
+
+            "human_required":
+                True,
+
+            "human_decision":
+                "reject",
+
+            "human_decision_reason":
+                final_reason
+        }
+
+#Save result
+def save_claim_result(
+    result
+):
+
+    results = load_pickle(
+        CLAIM_RESULTS_FILE,
+        []
+    )
+
+    claim_number = int(
+        result["claim_number"]
+    )
+
+    found = False
+
+    for index, item in enumerate(
+        results
+    ):
+
+        if int(
+            item.get(
+                "claim_number",
+                -1
+            )
+        ) == claim_number:
+
+            results[index] = result
+            found = True
+            break
+
+    if not found:
+
+        results.append(
+            result
+        )
+
+    save_pickle(
+        CLAIM_RESULTS_FILE,
+        results
+    )
+
+#Persistence node
+def persist_result_node(
+    state: ClaimState
+):
+
+    claim_number = int(
+        state["claim_number"]
+    )
+
+    decision = state.get(
+        "final_decision",
+        "Unknown"
+    )
+
+    if decision == "Approved":
+
+        status = "Approved"
+
+    elif decision == "Rejected":
+
+        status = "Rejected"
+
+    elif decision == "Human Approval Required":
+
+        status = "Human Approval Required"
+
+    else:
+
+        status = decision
+
+    result = {
 
         "claim_number":
-            int(
-                state["claim_number"]
-            ),
+            claim_number,
 
         "claimant_name":
-            state["claimant_name"],
+            state.get(
+                "claimant_name",
+                ""
+            ),
 
         "claim_amount":
-            float(
-                state["claim_amount"]
+            state.get(
+                "claim_amount",
+                0
+            ),
+
+        "claim_status":
+            status,
+
+        "final_decision":
+            decision,
+
+        "final_reason":
+            state.get(
+                "final_reason",
+                ""
+            ),
+
+        "human_decision":
+            state.get(
+                "human_decision",
+                None
+            ),
+
+        "human_decision_reason":
+            state.get(
+                "human_decision_reason",
+                ""
             ),
 
         "document_result":
@@ -1161,224 +1321,91 @@ def save_claim_result(
                 {}
             ),
 
-        "summary_result":
+        "claim_summary":
             state.get(
-                "summary_result",
+                "claim_summary",
                 {}
-            ),
-
-        "human_result":
-            state.get(
-                "human_result",
-                {}
-            ),
-
-        "final_decision":
-            state.get(
-                "final_decision",
-                ""
-            ),
-
-        "final_reason":
-            state.get(
-                "final_reason",
-                ""
-            ),
-
-        "processing_status":
-            state.get(
-                "processing_status",
-                ""
             )
     }
 
-    updated = False
-
-    for i, item in enumerate(
-        results
-    ):
-
-        if int(
-            item.get(
-                "claim_number",
-                -1
-            )
-        ) == int(
-            state["claim_number"]
-        ):
-
-            results[i] = result_record
-
-            updated = True
-
-            break
-
-    if not updated:
-
-        results.append(
-            result_record
-        )
-
-    with open(
-        CLAIM_RESULTS_FILE,
-        "wb"
-    ) as f:
-
-        pickle.dump(
-            results,
-            f
-        )
-
-
-
-# FINALIZE APPROVAL / REJECTION
-
-
-def finalize_human_decision(
-    claim_number: int,
-    decision: str,
-    reason: str
-):
-
-    decision = decision.strip().lower()
-
-    if decision == "approve":
-
-        final_decision = "Approved"
-
-        status = "Approved"
-
-    elif decision == "reject":
-
-        final_decision = "Rejected"
-
-        status = "Rejected"
-
-    else:
-
-        raise ValueError(
-            "Decision must be 'approve' or 'reject'."
-        )
-
-    claimant_name, claim_amount, documents = (
-        get_claim_documents(
-            claim_number
-        )
-    )
-
-    state = ClaimState(
-
-        claim_number=claim_number,
-
-        claimant_name=claimant_name,
-
-        claim_amount=claim_amount,
-
-        claim_documents=documents,
-
-        final_decision=final_decision,
-
-        final_reason=reason,
-
-        processing_status=status
-    )
-
-    # Save final status
-
-    update_claim_status(
-        claim_number,
-        status,
-        reason
-    )
-
-    # Update claim result
+    # Save detailed processing result
 
     save_claim_result(
-        state
+        result
     )
 
-    # Update claim metadata as well
+    # Update claim_status.pkl
 
-    update_claim_metadata_status(
+    update_claim_status(
         claim_number,
         status
     )
 
-    return state
+    return {}
 
-
-
-# UPDATE CLAIM METADATA
-
-
-def update_claim_metadata_status(
-    claim_number: int,
-    status: str
-):
-
-    metadata = load_claim_metadata()
-
-    changed = False
-
-    for item in metadata:
-
-        if int(
-            item.get(
-                "claim_number",
-                -1
-            )
-        ) == int(claim_number):
-
-            item["claim_status"] = status
-
-            changed = True
-
-    if changed:
-
-        with open(
-            CLAIMS_METADATA_FILE,
-            "wb"
-        ) as f:
-
-            pickle.dump(
-                metadata,
-                f
-            )
-
-
-
-# GRAPH NODES
-
-
-def prepare_claim_node(
+#Node to decide which node executes after the summary
+def route_after_summary(
     state: ClaimState
 ):
 
-    return {}
+    claim_amount = float(
+        state.get(
+            "claim_amount",
+            0
+        )
+    )
 
+    document_result = state.get(
+        "document_result",
+        {}
+    )
 
+    eligibility_result = state.get(
+        "eligibility_result",
+        {}
+    )
 
-# BUILD LANGGRAPH
+    fraud_result = state.get(
+        "fraud_result",
+        {}
+    )
 
+    # Rs. 10,000 or more
 
+    if claim_amount >= 10000:
+
+        return "human_approval"
+
+    # Uncertain eligibility
+
+    if eligibility_result.get(
+        "uncertain",
+        False
+    ):
+
+        return "human_approval"
+
+    # Fraud indicator
+
+    if fraud_result.get(
+        "fraud_indicator",
+        False
+    ):
+
+        return "human_approval"
+
+    # Everything else goes through automatic decision.
+
+    return "automatic_decision"
+
+#Build Langgraph
 def build_claim_graph():
 
     graph = StateGraph(
         ClaimState
     )
 
-    
-    # Initial node
-    
-
-    graph.add_node(
-        "prepare_claim",
-        prepare_claim_node
-    )
-
-    
-    # Required five agents/nodes
-    
+    # ADD NODES
 
     graph.add_node(
         "document_verification",
@@ -1401,58 +1428,38 @@ def build_claim_graph():
     )
 
     graph.add_node(
+        "automatic_decision",
+        automatic_decision_agent
+    )
+
+    graph.add_node(
         "human_approval",
         human_approval_agent
     )
 
-    
-    # Final processing nodes
-    
-
     graph.add_node(
-        "automatic_approval",
-        automatic_approval_node
+        "persist_result",
+        persist_result_node
     )
 
-    graph.add_node(
-        "rejection",
-        rejection_node
-    )
-
-    
-    # START
-    
+    # START -> THREE PARALLEL BRANCHES
 
     graph.add_edge(
         START,
-        "prepare_claim"
-    )
-
-    
-    # PARALLEL EXECUTION
-    #
-    # All three checks start independently after
-    # prepare_claim.
-    
-
-    graph.add_edge(
-        "prepare_claim",
         "document_verification"
     )
 
     graph.add_edge(
-        "prepare_claim",
+        START,
         "eligibility_check"
     )
 
     graph.add_edge(
-        "prepare_claim",
+        START,
         "fraud_detection"
     )
 
-    
-    # All three converge on Claim Summary
-    
+    # THREE BRANCHES -> SUMMARY
 
     graph.add_edge(
         "document_verification",
@@ -1469,179 +1476,249 @@ def build_claim_graph():
         "claim_summary"
     )
 
-    
-    # Conditional routing
-    
+    # SUMMARY -> CONDITIONAL ROUTING
 
     graph.add_conditional_edges(
 
         "claim_summary",
 
-        route_after_parallel_checks,
+        route_after_summary,
 
         {
-            "approve":
-                "automatic_approval",
+            "automatic_decision":
+                "automatic_decision",
 
-            "reject":
-                "rejection",
-
-            "human":
+            "human_approval":
                 "human_approval"
         }
     )
 
-    
-    # End states
-    
+    # DECISION -> PERSIST
 
     graph.add_edge(
-        "automatic_approval",
-        END
-    )
-
-    graph.add_edge(
-        "rejection",
-        END
+        "automatic_decision",
+        "persist_result"
     )
 
     graph.add_edge(
         "human_approval",
+        "persist_result"
+    )
+
+    # PERSIST -> END
+
+    graph.add_edge(
+        "persist_result",
         END
     )
 
-    return graph.compile()
+    memory = MemorySaver()
 
+    return graph.compile(
+        checkpointer=memory
+    )
 
+claim_graph = build_claim_graph()
 
-# RUN CLAIM
-
-
+#Main function to process claim
 def process_claim(
-    claim_number: int
+    claim_number
 ):
 
-    claimant_name, claim_amount, documents = (
-        get_claim_documents(
-            claim_number
+    claim_number = int(
+        claim_number
+    )
+
+    # LOAD CLAIM
+
+    claim = load_claim(
+        claim_number
+    )
+
+    print(
+        f"Processing Claim {claim_number}"
+    )
+
+    print(
+        f"Claimant: {claim['claimant_name']}"
+    )
+
+    print(
+        f"Amount: Rs. {claim['claim_amount']:,.2f}"
+    )
+
+    # RETRIEVE POLICY
+
+    print(
+        "\nRetrieving relevant policy..."
+    )
+
+    policy_context = retrieve_policy_context(
+        claim["documents"]
+    )
+
+    # INITIAL STATE
+
+    initial_state = {
+
+        "claim_number":
+            claim["claim_number"],
+
+        "claimant_name":
+            claim["claimant_name"],
+
+        "claim_amount":
+            claim["claim_amount"],
+
+        "claim_documents":
+            claim["documents"],
+
+        "policy_context":
+            policy_context
+    }
+
+    # THREAD ID
+
+    config = {
+
+        "configurable": {
+
+            "thread_id":
+                f"claim-{claim_number}"
+        }
+    }
+
+    # EXECUTE GRAPH
+
+    print(
+        "\nExecuting LangGraph..."
+    )
+    
+    result = claim_graph.invoke(
+        initial_state,
+        config=config
+    )
+
+    # CHECK FOR INTERRUPT
+
+    state_snapshot = claim_graph.get_state(
+        config
+    )
+
+    if state_snapshot.interrupts:
+
+        interrupt_data = (
+            state_snapshot.interrupts[0].value
         )
-    )
 
-    if not documents:
-
-        raise ValueError(
-            f"Claim {claim_number} was not found "
-            "in claim_metadata.pkl."
+        print(
+            "\n" + "=" * 60
         )
 
-    initial_state = ClaimState(
+        print(
+            "HUMAN APPROVAL REQUIRED"
+        )
 
-        claim_number=int(
-            claim_number
-        ),
+        print(
+            "=" * 60
+        )
 
-        claimant_name=claimant_name,
-
-        claim_amount=float(
-            claim_amount
-        ),
-
-        claim_documents=documents,
-
-        processing_status="Processing"
-    )
-
-    
-    # Mark claim as processing
-    
-
-    update_claim_status(
-        claim_number,
-        "Processing"
-    )
-
-    
-    # Build and invoke graph
-    
-
-    graph = build_claim_graph()
-
-    result = graph.invoke(
-        initial_state
-    )
-
-    
-    # Save result
-    
-
-    save_claim_result(
-        result
-    )
-
-    
-    # Automatic approval / rejection
-    #
-    # Human review remains pending until a claims officer
-    # makes a decision from Streamlit.
-    
-
-    if result.get(
-        "processing_status"
-    ) == "Approved":
-
-        update_claim_status(
-            claim_number,
-            "Approved",
-            result.get(
-                "final_reason",
-                ""
+        print(
+            "Claim Number:",
+            interrupt_data.get(
+                "claim_number"
             )
         )
 
-        update_claim_metadata_status(
-            claim_number,
-            "Approved"
+        print(
+            "Claim Amount:",
+            f"Rs. {interrupt_data.get('claim_amount', 0):,.2f}"
         )
 
-    elif result.get(
-        "processing_status"
-    ) == "Rejected":
+        print(
+            "\nReasons:"
+        )
 
-        update_claim_status(
-            claim_number,
-            "Rejected",
-            result.get(
-                "final_reason",
-                ""
+        for reason in interrupt_data.get(
+            "reasons",
+            []
+        ):
+
+            print(
+                "-",
+                reason
             )
+
+        print(
+            "\nOptions:"
         )
 
-        update_claim_metadata_status(
-            claim_number,
-            "Rejected"
+        print(
+            "1. approve"
         )
 
-    elif result.get(
-        "processing_status"
-    ) == "Human Approval Required":
-
-        update_claim_status(
-            claim_number,
-            "Human Approval Required",
-            "; ".join(
-                result.get(
-                    "human_result",
-                    {}
-                ).get(
-                    "reasons",
-                    []
-                )
-            )
+        print(
+            "2. reject"
         )
 
-        update_claim_metadata_status(
-            claim_number,
-            "Human Approval Required"
+        print(
+            "=" * 60
         )
+
+        return {
+            "status":
+                "Human Approval Required",
+
+            "claim_number":
+                claim_number,
+
+            "interrupt":
+                interrupt_data,
+
+            "config":
+                config,
+
+            "state":
+                result
+        }
+
+    # NORMAL COMPLETION
+
+    print(
+        "\n" + "=" * 60
+    )
+
+    print(
+        "CLAIM PROCESSING COMPLETE"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "Claim Number:",
+        result.get(
+            "claim_number"
+        )
+    )
+
+    print(
+        "Status:",
+        result.get(
+            "final_decision"
+        )
+    )
+
+    print(
+        "Reason:",
+        result.get(
+            "final_reason"
+        )
+    )
+
+    print(
+        "=" * 60
+    )
 
     return result
