@@ -21,3 +21,15 @@ langchain-openai
 streamlit
 python-dotenv
 pydantic
+ipykernel
+pandas
+scikit-learn==1.8.0
+streamlit
+langchain
+langchain-community
+langchain-openai
+langchain-text-splitters
+zstandard>=0.23.0
+
+
+
